@@ -1,24 +1,25 @@
 ---
 description: "Dispatch tasks to engineer_team agents in isolated tmux sessions"
 allowed-tools: ["Task", "Read", "Bash", "mcp__tmux__create-session", "mcp__tmux__execute-command", "mcp__tmux__list-sessions", "mcp__tmux__capture-pane"]
-argument-hint: "[agent-type] task description OR list of tasks"
+argument-hint: "[agent-type] task description [--max-iter N]"
 ---
 
-# Super - Fast Agent Dispatch
+# Super - Fast Agent Dispatch with Dev Feedback Loop
 
-Dispatch tasks to engineer_team agents running in isolated tmux sessions. Full output stays in tmux, only DONE signals return here.
+Dispatch tasks to engineer_team agents running in isolated tmux sessions. **Built-in feedback loop** ensures agents verify their work before signaling DONE. All iteration stays in the tmux session (no parent context bloat).
 
 ## Usage
 
 ```
 /super [agent-type] task description
+/super be Fix the auth bug --max-iter 10
 /super list of tasks (auto-selects agent types)
 ```
 
 ## Agent Types
 
 | Short | Full | Use For |
-|-------|------|---------||
+|-------|------|---------|  
 | be | backend-developer | APIs, server code, databases |
 | fe | frontend-developer | UI, React, CSS |
 | py | python-pro | Python code, scripts |
@@ -28,6 +29,29 @@ Dispatch tasks to engineer_team agents running in isolated tmux sessions. Full o
 | test | test-automator | Tests, coverage |
 | api | api-designer | API design, endpoints |
 
+## Dev Feedback Loop (Always Enabled)
+
+Each agent runs a **verify-fix loop** before signaling DONE:
+
+```
++-----------------------------------------+
+| DEV LOOP (default: 7 iterations max)    |
+|                                         |
+|  1. IMPLEMENT the task                  |
+|  2. VERIFY with dev-verify.sh           |
+|  3. If FAIL: FIX and go to step 2       |
+|  4. If PASS: Signal DONE                |
+|  5. If max iterations: Signal DONE      |
+|     with partial status                 |
++-----------------------------------------+
+```
+
+**Verification auto-detects project type:**
+- Python: ruff/flake8, mypy/pyright, pytest
+- Node.js: lint, tsc, test, build
+- Go: go vet, go build, go test
+- Rust: clippy, cargo build, cargo test
+
 ## Dispatch Flow
 
 1. Parse task(s) from argument
@@ -35,51 +59,38 @@ Dispatch tasks to engineer_team agents running in isolated tmux sessions. Full o
    - Check orchestrator capacity (max 5 concurrent)
    - Create tmux session via MCP tools
    - Register in orchestrator state
-   - Spawn bash subagent to run claude in the session
+   - Spawn bash subagent with DEV LOOP prompt
 3. Return dispatch summary only (not full output)
 
 ## Implementation
 
 When user invokes `/super`:
 
-1. Parse the argument to extract agent type and task description
-2. Use bash subagent to dispatch:
+1. Parse the argument to extract agent type, task description, and optional `--max-iter N`
+2. Generate a unique task_id (e.g., timestamp or short hash)
+3. Run the dispatch script:
 
-```python
-Task(
-    subagent_type="bash-agent",
-    model="haiku",
-    prompt=f"""
-Dispatch task to tmux session:
-
-1. Check capacity:
-python3 -c "
-import sys, os
-sys.path.insert(0, os.environ.get('SUPER_DISPATCH_HOME', os.path.expanduser('~/.super-dispatch')))
-from tmux_orchestrator import TmuxOrchestrator
-o = TmuxOrchestrator()
-print('CAN_SPAWN' if o.can_spawn() else 'QUEUE')
-"
-
-2. If CAN_SPAWN, create session and dispatch:
-- Use mcp__tmux__create-session with name "agent-{{task_id}}"
-- Register: python3 -c "import sys, os; sys.path.insert(0, os.environ.get('SUPER_DISPATCH_HOME', os.path.expanduser('~/.super-dispatch'))); from tmux_orchestrator import TmuxOrchestrator; o = TmuxOrchestrator(); o.add_session('{{task_id}}', '{{agent_type}}')"
-- Execute claude in session with the task prompt
-
-3. If QUEUE, add to queue:
-python3 -c "import sys, os; sys.path.insert(0, os.environ.get('SUPER_DISPATCH_HOME', os.path.expanduser('~/.super-dispatch'))); from tmux_orchestrator import TmuxOrchestrator; o = TmuxOrchestrator(); o.queue_task('{{task_id}}', '{{agent_type}}', prompt='{{task}}')"
-
-OUTPUT REQUIREMENTS (MANDATORY):
-- Session ID created or queued
-- Status: dispatched/queued
-- 1 sentence summary
-"""
-)
+```bash
+$SUPER_DISPATCH_HOME/scripts/super-dispatch.sh \
+    "{task_id}" "{agent_type}" "{cwd}" "{max_iter}" "{task_description}"
 ```
 
-## Agent Prompt Template
+The script handles:
+- Orchestrator capacity check (queue if at max)
+- Prompt file generation with DEV LOOP built-in
+- Tmux session creation
+- Claude launch with the prompt
 
-When spawning claude in tmux session, use this prompt structure:
+**Quick dispatch example:**
+```bash
+# Direct bash call
+$SUPER_DISPATCH_HOME/scripts/super-dispatch.sh \
+    "$(date +%s)" "backend-developer" "$(pwd)" "7" "Fix the auth bug in api/auth.py"
+```
+
+## Agent Prompt Template (with Dev Feedback Loop)
+
+The prompt written to `/tmp/agent-{task_id}-prompt.txt`:
 
 ```
 You are a {agent_type} agent running in an isolated tmux session.
@@ -88,12 +99,46 @@ TASK: {task_description}
 
 WORKING DIRECTORY: {cwd}
 
-When complete, output this signal:
+===============================================================
+DEV FEEDBACK LOOP - MANDATORY BEFORE COMPLETION
+===============================================================
+
+You MUST follow this verify-fix loop before signaling DONE.
+MAX ITERATIONS: {max_iter} (default: 7)
+
+LOOP:
+  iteration = 1
+  while iteration <= {max_iter}:
+      1. IMPLEMENT/FIX the task (or continue from previous iteration)
+
+      2. VERIFY - Run the verification script:
+         $SUPER_DISPATCH_HOME/scripts/dev-verify.sh .
+
+      3. CHECK RESULTS:
+         - If "STATUS: ALL CHECKS PASSED" -> Exit loop, signal DONE
+         - If "STATUS: VERIFICATION FAILED" -> Note failures, increment iteration
+
+      4. If iteration > {max_iter}: Exit loop with partial completion
+
+      iteration++
+
+===============================================================
+
+IMPORTANT RULES:
+1. Run dev-verify.sh AFTER EVERY significant change
+2. Do NOT signal DONE until verification passes (or max iterations)
+3. Each iteration should fix issues found in verification
+4. If stuck after 3 iterations on same error, try a different approach
+
+When complete (verification passed OR max iterations reached), output:
+
 ---ORCHESTRATOR-SIGNAL---
-STATUS: DONE
-SUMMARY: {1-3 sentence summary}
+STATUS: {DONE|PARTIAL}
+ITERATIONS: {n}/{max_iter}
+VERIFICATION: {PASSED|FAILED}
+SUMMARY: {1-3 sentence summary of what was accomplished}
 FILES_CHANGED: {paths}
-COMMIT_TYPE: feat|fix|refactor|docs|test|chore
+REMAINING_ISSUES: {any unfixed issues, or "none"}
 ---END-SIGNAL---
 
 Keep your work focused. Your full output stays here in tmux.
@@ -106,8 +151,8 @@ Only the DONE signal returns to the orchestrator.
 # Single task with explicit agent
 /super be Add rate limiting to the API endpoints
 
-# Single task with short alias
-/super py Refactor the data processing pipeline
+# With custom max iterations
+/super py Refactor the data processing pipeline --max-iter 10
 
 # Auto-detect agent from task
 /super Fix the login bug in auth.py
@@ -122,3 +167,13 @@ After dispatching, check status with:
 - `/tmux-orchestrator:status` - See active/queued counts
 - `tmux list-sessions` - See raw tmux sessions
 - `/tmux-orchestrator:peek agent-{id}` - View specific agent output
+
+## Monitoring Agent Iterations
+
+```bash
+# See current iteration in agent's tmux session
+tmux capture-pane -t agent-{id} -p | grep -E "(iteration|VERIFY|STATUS)"
+
+# View full agent output
+tmux capture-pane -t agent-{id} -p -S -1000
+```
