@@ -1,6 +1,6 @@
 ---
 description: "Dispatch tasks to engineer_team agents in isolated tmux sessions"
-allowed-tools: ["Task", "Read", "Bash", "mcp__tmux__create-session", "mcp__tmux__execute-command", "mcp__tmux__list-sessions", "mcp__tmux__capture-pane"]
+allowed-tools: ["Read", "Bash", "mcp__tmux__create-session", "mcp__tmux__execute-command", "mcp__tmux__list-sessions", "mcp__tmux__capture-pane"]
 argument-hint: "[agent-type] task description [--max-iter N]"
 ---
 
@@ -19,7 +19,7 @@ Dispatch tasks to engineer_team agents running in isolated tmux sessions. **Buil
 ## Agent Types
 
 | Short | Full | Use For |
-|-------|------|---------|  
+|-------|------|---------|}
 | be | backend-developer | APIs, server code, databases |
 | fe | frontend-developer | UI, React, CSS |
 | py | python-pro | Python code, scripts |
@@ -29,28 +29,36 @@ Dispatch tasks to engineer_team agents running in isolated tmux sessions. **Buil
 | test | test-automator | Tests, coverage |
 | api | api-designer | API design, endpoints |
 
-## Dev Feedback Loop (Always Enabled)
+## tldr Integration (Exploration + Verification)
 
-Each agent runs a **verify-fix loop** before signaling DONE:
+Agents use the `tldr` CLI for both **exploration** and **verification**:
 
-```
-+-----------------------------------------+
-| DEV LOOP (default: 7 iterations max)    |
-|                                         |
-|  1. IMPLEMENT the task                  |
-|  2. VERIFY with dev-verify.sh           |
-|  3. If FAIL: FIX and go to step 2       |
-|  4. If PASS: Signal DONE                |
-|  5. If max iterations: Signal DONE      |
-|     with partial status                 |
-+-----------------------------------------+
+### Exploration (Before Coding)
+```bash
+tldr structure . --lang python    # See code structure
+tldr search "pattern" .           # Find relevant code
+tldr impact func_name .           # Impact analysis before refactoring
+tldr context entry_func --depth 2 # Get LLM-ready context
 ```
 
-**Verification auto-detects project type:**
-- Python: ruff/flake8, mypy/pyright, pytest
-- Node.js: lint, tsc, test, build
-- Go: go vet, go build, go test
-- Rust: clippy, cargo build, cargo test
+### Verification (dev-verify.sh - tldr powered)
+```
+┌─────────────────────────────────────────┐
+│ DEV LOOP (default: 7 iterations max)    │
+│                                         │
+│  1. EXPLORE with tldr commands          │
+│  2. IMPLEMENT the task                  │
+│  3. VERIFY with dev-verify.sh           │
+│  4. If FAIL: FIX and go to step 3       │
+│  5. If PASS: Signal DONE                │
+└─────────────────────────────────────────┘
+```
+
+**Verification checks (via tldr):**
+- `tldr diagnostics` - Type checking + linting (pyright/ruff)
+- `tldr dead` - Dead code detection (warnings)
+- `tldr change-impact --run` - Selective test execution
+- Build/syntax checks per language
 
 ## Dispatch Flow
 
@@ -62,6 +70,29 @@ Each agent runs a **verify-fix loop** before signaling DONE:
    - Spawn bash subagent with DEV LOOP prompt
 3. Return dispatch summary only (not full output)
 
+## Queue Handling (MANDATORY)
+
+When a task returns **QUEUED** status, do NOT bypass the queue by doing work directly. Instead:
+
+1. **Clear stale sessions** from the orchestrator:
+   ```bash
+   /home/pook/engineer-team/.beads/scripts/orchestrator-cleanup.sh
+   ```
+
+2. **Re-dispatch** the task through `/super` again
+
+3. **Wait for completion** - monitor with `/tmux-orchestrator:status`
+
+**Why this matters:**
+- Doing work directly in parent context costs **1000-5000 tokens** of context bloat
+- Agent sessions isolate all iteration and exploration to tmux (zero parent cost)
+- The queue exists to prevent overload, not to be bypassed
+
+**If queue persists after cleanup:**
+- Check for zombie sessions: `tmux list-sessions | grep agent-`
+- Kill stale sessions: `tmux kill-session -t agent-{id}`
+- Verify orchestrator state: `cat /tmp/orchestrator-state.json`
+
 ## Implementation
 
 When user invokes `/super`:
@@ -71,7 +102,7 @@ When user invokes `/super`:
 3. Run the dispatch script:
 
 ```bash
-$SUPER_DISPATCH_HOME/scripts/super-dispatch.sh \
+/home/pook/engineer-team/.beads/scripts/super-dispatch.sh \
     "{task_id}" "{agent_type}" "{cwd}" "{max_iter}" "{task_description}"
 ```
 
@@ -84,65 +115,8 @@ The script handles:
 **Quick dispatch example:**
 ```bash
 # Direct bash call
-$SUPER_DISPATCH_HOME/scripts/super-dispatch.sh \
+/home/pook/engineer-team/.beads/scripts/super-dispatch.sh \
     "$(date +%s)" "backend-developer" "$(pwd)" "7" "Fix the auth bug in api/auth.py"
-```
-
-## Agent Prompt Template (with Dev Feedback Loop)
-
-The prompt written to `/tmp/agent-{task_id}-prompt.txt`:
-
-```
-You are a {agent_type} agent running in an isolated tmux session.
-
-TASK: {task_description}
-
-WORKING DIRECTORY: {cwd}
-
-===============================================================
-DEV FEEDBACK LOOP - MANDATORY BEFORE COMPLETION
-===============================================================
-
-You MUST follow this verify-fix loop before signaling DONE.
-MAX ITERATIONS: {max_iter} (default: 7)
-
-LOOP:
-  iteration = 1
-  while iteration <= {max_iter}:
-      1. IMPLEMENT/FIX the task (or continue from previous iteration)
-
-      2. VERIFY - Run the verification script:
-         $SUPER_DISPATCH_HOME/scripts/dev-verify.sh .
-
-      3. CHECK RESULTS:
-         - If "STATUS: ALL CHECKS PASSED" -> Exit loop, signal DONE
-         - If "STATUS: VERIFICATION FAILED" -> Note failures, increment iteration
-
-      4. If iteration > {max_iter}: Exit loop with partial completion
-
-      iteration++
-
-===============================================================
-
-IMPORTANT RULES:
-1. Run dev-verify.sh AFTER EVERY significant change
-2. Do NOT signal DONE until verification passes (or max iterations)
-3. Each iteration should fix issues found in verification
-4. If stuck after 3 iterations on same error, try a different approach
-
-When complete (verification passed OR max iterations reached), output:
-
----ORCHESTRATOR-SIGNAL---
-STATUS: {DONE|PARTIAL}
-ITERATIONS: {n}/{max_iter}
-VERIFICATION: {PASSED|FAILED}
-SUMMARY: {1-3 sentence summary of what was accomplished}
-FILES_CHANGED: {paths}
-REMAINING_ISSUES: {any unfixed issues, or "none"}
----END-SIGNAL---
-
-Keep your work focused. Your full output stays here in tmux.
-Only the DONE signal returns to the orchestrator.
 ```
 
 ## Examples
@@ -177,3 +151,12 @@ tmux capture-pane -t agent-{id} -p | grep -E "(iteration|VERIFY|STATUS)"
 # View full agent output
 tmux capture-pane -t agent-{id} -p -S -1000
 ```
+
+## Ralph Integration
+
+After agent signals DONE, optionally review with Ralph:
+```bash
+ralph review code --spec spec.md --files changed_files
+/ralph-loop  # Interactive review loop
+```
+See `/help` for full Ralph documentation.
