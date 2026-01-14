@@ -10,32 +10,28 @@ CWD="${3:?Working directory required}"
 MAX_ITER="${4:-7}"
 TASK_DESC="${5:?Task description required}"
 
-# Use environment variable or default
-SUPER_DISPATCH_HOME="${SUPER_DISPATCH_HOME:-$HOME/.super-dispatch}"
+BEADS_DIR="/home/pook/engineer-team/.beads"
 SESSION_NAME="agent-${TASK_ID}"
 PROMPT_FILE="/tmp/${SESSION_NAME}-prompt.txt"
 
-# Check orchestrator capacity (if orchestrator exists)
-CAN_SPAWN="yes"
-if [[ -f "$SUPER_DISPATCH_HOME/lib/tmux_orchestrator.py" ]]; then
-    CAN_SPAWN=$(python3 -c "
-import sys; sys.path.insert(0, '$SUPER_DISPATCH_HOME/lib')
+# Check orchestrator capacity
+CAN_SPAWN=$(python3 -c "
+import sys; sys.path.insert(0, '$BEADS_DIR')
 from tmux_orchestrator import TmuxOrchestrator
 o = TmuxOrchestrator()
 print('yes' if o.can_spawn() else 'no')
 " 2>/dev/null || echo "yes")
-fi
 
 if [[ "$CAN_SPAWN" == "no" ]]; then
     # Queue the task
     python3 -c "
-import sys; sys.path.insert(0, '$SUPER_DISPATCH_HOME/lib')
+import sys; sys.path.insert(0, '$BEADS_DIR')
 from tmux_orchestrator import TmuxOrchestrator
 TmuxOrchestrator().queue_task('$TASK_ID', '$AGENT_TYPE', prompt='''$TASK_DESC''')
 "
     echo "QUEUED: $SESSION_NAME ($AGENT_TYPE)"
     echo "Queue position: $(python3 -c "
-import sys; sys.path.insert(0, '$SUPER_DISPATCH_HOME/lib')
+import sys; sys.path.insert(0, '$BEADS_DIR')
 from tmux_orchestrator import TmuxOrchestrator
 print(len(TmuxOrchestrator().queue))
 ")"
@@ -55,10 +51,34 @@ WORKING DIRECTORY: $CWD
 
 PROMPT_TASK
 
+cat >> "$PROMPT_FILE" << 'PROMPT_TLDR'
+════════════════════════════════════════════════════════════════════════════════
+TLDR EXPLORATION - USE BEFORE CODING
+════════════════════════════════════════════════════════════════════════════════
+
+The `tldr` CLI is available for efficient codebase analysis. Use it BEFORE writing code:
+
+EXPLORATION COMMANDS:
+  tldr structure . --lang python    # See code structure (functions, classes)
+  tldr search "pattern" .           # Find relevant code
+  tldr context entry_func --depth 2 # Get LLM-ready context for a function
+  tldr impact func_name .           # See what calls this function (before refactoring)
+  tldr imports file.py              # See what a file imports
+  tldr importers module .           # Find all files importing a module
+
+WORKFLOW:
+  1. Run `tldr structure .` to understand the codebase layout
+  2. Run `tldr search "keyword"` to find relevant files
+  3. Run `tldr impact` before modifying any function
+  4. THEN implement your changes
+  5. Run dev-verify.sh to validate
+
+PROMPT_TLDR
+
 cat >> "$PROMPT_FILE" << 'PROMPT_DEVLOOP'
-================================================================================
+════════════════════════════════════════════════════════════════════════════════
 DEV FEEDBACK LOOP - MANDATORY BEFORE COMPLETION
-================================================================================
+════════════════════════════════════════════════════════════════════════════════
 
 You MUST follow this verify-fix loop before signaling completion.
 
@@ -69,13 +89,10 @@ MAX ITERATIONS: $MAX_ITER
 
 PROMPT_ITER
 
-# Get the script directory for dev-verify.sh path
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-cat >> "$PROMPT_FILE" << PROMPT_LOOP
+cat >> "$PROMPT_FILE" << 'PROMPT_LOOP'
 THE LOOP:
 
-\`\`\`
+```
 iteration = 1
 while iteration <= MAX_ITERATIONS:
 
@@ -84,22 +101,22 @@ while iteration <= MAX_ITERATIONS:
     - Subsequent iterations: Fix issues from previous verification
 
     # Step 2: VERIFY
-    Run: $SCRIPT_DIR/dev-verify.sh .
+    Run: /home/pook/engineer-team/.beads/scripts/dev-verify.sh .
 
     # Step 3: CHECK RESULTS
     - If output shows "STATUS: ALL CHECKS PASSED":
-        -> Break loop, signal DONE with VERIFICATION: PASSED
+        → Break loop, signal DONE with VERIFICATION: PASSED
     - If output shows "STATUS: VERIFICATION FAILED":
-        -> Read the failures, increment iteration, continue loop
+        → Read the failures, increment iteration, continue loop
 
     # Step 4: MAX ITERATIONS CHECK
     If iteration > MAX_ITERATIONS:
-        -> Break loop, signal DONE with VERIFICATION: PARTIAL
+        → Break loop, signal DONE with VERIFICATION: PARTIAL
 
     iteration++
-\`\`\`
+```
 
-================================================================================
+════════════════════════════════════════════════════════════════════════════════
 
 CRITICAL RULES:
 
@@ -109,7 +126,7 @@ CRITICAL RULES:
 4. If stuck on the same error for 3+ iterations, try a completely different approach
 5. Read verification output carefully - it tells you exactly what failed
 
-================================================================================
+════════════════════════════════════════════════════════════════════════════════
 
 COMPLETION SIGNAL FORMAT (output this when done):
 
@@ -122,7 +139,7 @@ FILES_CHANGED: {comma-separated list of file paths}
 REMAINING_ISSUES: {any unfixed issues, or "none"}
 ---END-SIGNAL---
 
-================================================================================
+════════════════════════════════════════════════════════════════════════════════
 
 Your full output stays in this tmux session.
 Only the completion signal matters to the orchestrator.
@@ -137,14 +154,12 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
 fi
 tmux new-session -d -s "$SESSION_NAME" -c "$CWD"
 
-# Register with orchestrator (if available)
-if [[ -f "$SUPER_DISPATCH_HOME/lib/tmux_orchestrator.py" ]]; then
-    python3 -c "
-import sys; sys.path.insert(0, '$SUPER_DISPATCH_HOME/lib'
+# Register with orchestrator
+python3 -c "
+import sys; sys.path.insert(0, '$BEADS_DIR')
 from tmux_orchestrator import TmuxOrchestrator
 TmuxOrchestrator().add_session('$TASK_ID', '$AGENT_TYPE')
 " 2>/dev/null || true
-fi
 
 # Launch claude in the session
 tmux send-keys -t "$SESSION_NAME" "claude --dangerously-skip-permissions < '$PROMPT_FILE'" Enter
